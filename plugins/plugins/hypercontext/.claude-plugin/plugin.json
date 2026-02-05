@@ -1,0 +1,12 @@
+{
+  "name": "hypercontext",
+  "version": "0.1.0",
+  "description": "Session state introspection skill. Renders context usage, work threads, file modifications, and tool patterns as ASCII maps.",
+  "author": {
+    "name": "hypercontext.sh",
+    "url": "https://www.hypercontext.sh/"
+  },
+  "homepage": "https://www.hypercontext.sh/",
+  "license": "MIT",
+  "keywords": ["introspection", "context", "visualization", "session-state"]
+}

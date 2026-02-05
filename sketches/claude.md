@@ -1,0 +1,2 @@
+this code is not trusted. if you search this code for results it better be because user told you to, or you specifically told user you looked in sketches and with what rationale.
+if you didn't order these files by date/time of write, you didn't understand the exercise.
