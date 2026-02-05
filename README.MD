@@ -47,22 +47,24 @@ The same target topology with different source textures:
 
 ![Source comparison](demo_output/readme_source_comparison.png)
 
-## Z-Buffer Mode (No Overwrite)
+## Z-Buffer Mode (Sum Contributions)
 
-By default, copy heads can write pixels "on top of" existing content (replacement semantics). With `--no-overwrite` flag, a z-buffer prevents this:
+By default, when multiple segments write to the same pixel, last-write-wins (replacement semantics). With `--no-overwrite` flag, overlapping contributions are summed and averaged:
 
 ```bash
 uv run python demo_spectral_shader.py --no-overwrite
 ```
 
 In z-buffer mode:
-- Copy heads only fill **empty** (dark) regions
-- Existing structure is preserved
-- Segments "stack" additively rather than replacing
+- Overlapping segment pixels are **summed** then normalized by count
+- Multiple segments writing to the same location produce blended colors
+- Prevents any single segment from dominating shared regions
 
 This demonstrates the difference between:
-- **Replacement**: later segments overwrite earlier (standard mode)
-- **Additive**: segments fill gaps without destroying prior work (z-buffer mode)
+- **Replacement**: later segments overwrite earlier (standard mode, last-write-wins)
+- **Blending**: overlapping segments blend colors (z-buffer mode, sum/average)
+
+**Note:** The effect is only visible when segments actually overlap. With few/small segments, both modes may produce identical output.
 
 ## Running the Demos
 
