@@ -14,6 +14,7 @@ torch.compile friendly: no dynamic shapes, consistent dtypes, vectorized ops.
 import torch
 import math
 from typing import Dict, Tuple, Optional, List, Callable
+from dataclasses import dataclass
 
 
 # Type alias for shape tuple to avoid repeated indexing
@@ -208,8 +209,161 @@ def apply_low_gate_transform(
 
 
 # ============================================================
-# 4. CROSS-ATTENTION TRANSFER (PURE TENSOR - NO SEGMENT EXTRACTION)
+# 4. SEGMENT INFRASTRUCTURE + CROSS-ATTENTION TRANSFER
 # ============================================================
+
+@dataclass
+class Segment:
+    """A contiguous region extracted from the image. Coords as (x, y)."""
+    mask: torch.Tensor          # (h, w) boolean local mask within bbox
+    bbox: Tuple[int, int, int, int]  # (y0, y1, x0, x1)
+    centroid: torch.Tensor      # (2,) as (x, y)
+    coords: torch.Tensor        # (M, 2) pixel positions as (x, y)
+    colors: torch.Tensor        # (M, 3) source RGB values
+    label: int                  # segment ID
+
+
+def _torch_connected_components(mask: torch.Tensor) -> torch.Tensor:
+    """Connected components via 4-direction min + pointer jumping.
+
+    Pointer jumping doubles propagation distance each iteration, reducing
+    convergence from O(diameter) to O(log(diameter)) iterations.
+    """
+    H, W = mask.shape
+    device = mask.device
+    n = H * W
+    flat_mask = mask.reshape(-1)
+    parent = torch.arange(n, device=device, dtype=torch.long)
+    parent[~flat_mask] = -1
+
+    idx = torch.arange(n, device=device)
+    row, col = idx // W, idx % W
+    up_idx = (idx - W).clamp(0, n - 1)
+    down_idx = (idx + W).clamp(0, n - 1)
+    left_idx = (idx - 1).clamp(0, n - 1)
+    right_idx = (idx + 1).clamp(0, n - 1)
+    up_valid = flat_mask & (row > 0) & flat_mask[up_idx]
+    down_valid = flat_mask & (row < H - 1) & flat_mask[down_idx]
+    left_valid = flat_mask & (col > 0) & flat_mask[left_idx]
+    right_valid = flat_mask & (col < W - 1) & flat_mask[right_idx]
+
+    max_iter = int(math.ceil(math.log2(max(H, W) + 1))) + 5
+    for _ in range(max_iter):
+        old_parent = parent.clone()
+        p = parent.clone()
+        p = torch.where(up_valid, torch.minimum(p, parent[up_idx]), p)
+        p = torch.where(down_valid, torch.minimum(p, parent[down_idx]), p)
+        p = torch.where(left_valid, torch.minimum(p, parent[left_idx]), p)
+        p = torch.where(right_valid, torch.minimum(p, parent[right_idx]), p)
+        parent = p
+        valid = parent >= 0
+        jumped = parent[parent.clamp(0)]
+        parent = torch.where(valid, jumped, parent)
+        if torch.equal(parent, old_parent):
+            break
+
+    labels = parent.reshape(H, W)
+    labels[~mask] = -1
+    unique_labels = torch.unique(labels[labels >= 0])
+    if unique_labels.numel() == 0:
+        return labels
+    mapping = torch.full((n,), -1, device=device, dtype=torch.long)
+    mapping[unique_labels] = torch.arange(len(unique_labels), device=device)
+    return torch.where(labels >= 0, mapping[labels.clamp(0)], labels)
+
+
+def _labels_to_segments(image_rgb: torch.Tensor, labels: torch.Tensor,
+                        min_pixels: int, max_segments: int) -> List[Segment]:
+    """Convert label map to list of Segment objects."""
+    device = image_rgb.device
+    unique_labels = torch.unique(labels[labels >= 0])
+    segments = []
+    for label_val in unique_labels:
+        mask = labels == label_val
+        pixel_count = mask.sum().item()
+        if pixel_count < min_pixels:
+            continue
+        ys, xs = torch.where(mask)
+        y0, y1 = ys.min().item(), ys.max().item() + 1
+        x0, x1 = xs.min().item(), xs.max().item() + 1
+        centroid = torch.tensor([xs.float().mean(), ys.float().mean()], device=device)
+        coords = torch.stack([xs.float(), ys.float()], dim=-1)
+        colors = image_rgb[ys, xs]
+        local_mask = mask[y0:y1, x0:x1]
+        segments.append(Segment(mask=local_mask, bbox=(y0, y1, x0, x1),
+                                centroid=centroid, coords=coords,
+                                colors=colors, label=label_val.item()))
+        if len(segments) >= max_segments:
+            break
+    return segments
+
+
+def extract_segments(img: torch.Tensor, gate: torch.Tensor,
+                     gate_threshold: float = 0.5, min_pixels: int = 20,
+                     max_segments: int = 50) -> List[Segment]:
+    """Extract segments from low-gate contour regions."""
+    H, W, _ = img.shape
+    gray = 0.299 * img[:,:,0] + 0.587 * img[:,:,1] + 0.114 * img[:,:,2]
+    gray_norm = (gray - gray.mean()) / (gray.std() + 1e-8)
+    contours = torch.abs(gray_norm) > 1.0
+    low_gate = gate < gate_threshold
+    eligible = contours & low_gate
+    if eligible.sum() < min_pixels * 3:
+        if contours.any():
+            gate_on_contours = gate[contours]
+            gate_median = torch.median(gate_on_contours)
+            eligible = contours & (gate < gate_median)
+    labels = _torch_connected_components(eligible)
+    return _labels_to_segments(img, labels, min_pixels, max_segments)
+
+
+def compute_segment_signature(segment: Segment, fiedler: torch.Tensor) -> torch.Tensor:
+    """Compute 4D spectral signature: [mean_f, std_f, log_size, aspect]."""
+    y0, y1, x0, x1 = segment.bbox
+    H, W = fiedler.shape
+    device = fiedler.device
+    xs = segment.coords[:, 0].long().clamp(0, W-1)
+    ys = segment.coords[:, 1].long().clamp(0, H-1)
+    fiedler_vals = fiedler[ys, xs]
+    mean_f = fiedler_vals.mean()
+    std_f = fiedler_vals.std() + 1e-8
+    size = torch.tensor(len(fiedler_vals), device=device, dtype=torch.float32)
+    aspect = torch.tensor((x1 - x0) / max(y1 - y0, 1), device=device, dtype=torch.float32)
+    return torch.stack([mean_f, std_f, torch.log(size + 1), aspect])
+
+
+def match_segments(sigs_A: torch.Tensor, sigs_B: torch.Tensor) -> torch.Tensor:
+    """Match A→B segments by L2 distance in normalized signature space. Returns (Q,) indices."""
+    q_norm = (sigs_A - sigs_A.mean(0)) / (sigs_A.std(0) + 1e-8)
+    s_norm = (sigs_B - sigs_B.mean(0)) / (sigs_B.std(0) + 1e-8)
+    diff = q_norm.unsqueeze(1) - s_norm.unsqueeze(0)
+    distances = (diff ** 2).sum(dim=-1)
+    _, indices = torch.topk(distances, k=1, dim=1, largest=False)
+    return indices.squeeze(-1)
+
+
+def scatter_to_layer(coords: torch.Tensor, colors: torch.Tensor,
+                     H: int, W: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scatter points to a layer buffer with occupancy mask."""
+    device = coords.device
+    layer = torch.zeros((H, W, 3), device=device, dtype=colors.dtype)
+    mask = torch.zeros((H, W), device=device, dtype=colors.dtype)
+    if coords.shape[0] == 0:
+        return layer, mask
+    px = coords[:, 0].round().long().clamp(0, W - 1)
+    py = coords[:, 1].round().long().clamp(0, H - 1)
+    layer[py, px] = colors
+    mask[py, px] = 1.0
+    return layer, mask
+
+
+def composite_layers_hadamard(shadow: torch.Tensor, shadow_mask: torch.Tensor,
+                              front: torch.Tensor, front_mask: torch.Tensor) -> torch.Tensor:
+    """Hadamard composite: front overwrites shadow where both exist."""
+    fm = front_mask.unsqueeze(-1)
+    sm = shadow_mask.unsqueeze(-1)
+    return shadow * sm * (1 - fm) + front * fm
+
 
 def cross_attention_transfer(
     image_A: torch.Tensor,          # (H_A, W_A, 3) target: defines WHERE
@@ -219,104 +373,93 @@ def cross_attention_transfer(
     gate_A: torch.Tensor,           # (H_A, W_A) gate values for A
     contours_A: torch.Tensor,       # (H_A, W_A) contour mask for A
     effect_strength: float = 1.0,
-    n_bins: int = 256
+    shadow_offset: float = 7.0,
+    translation_strength: float = 20.0,
+    min_pixels: int = 20,
+    max_segments: int = 50
 ) -> torch.Tensor:
     """
-    Cross-attention based two-image transfer (pure tensor, no segments).
+    Segment-based cross-attention transfer: extract, match, transplant, scatter.
 
-    Implements spec: phi_A @ phi_B.T gives spectral correspondence.
-    For k=1 (Fiedler only): pixels with similar Fiedler values correspond.
-
-    Algorithm:
-    1. Normalize Fiedlers to [0, 1]
-    2. Build spectral lookup: for each Fiedler bin, find mean (y, x) in B
-    3. For each A pixel, look up corresponding B position via Fiedler similarity
-    4. Sample B at those positions using grid_sample
-    5. Composite based on low-gate mask
-
-    This replaces: extract_segments_from_contours + match_segments_by_topology
-    + transfer_segments_A_to_B + draw_all_segments_batched
-
-    No connected components, no coordinate unpacking, no segment iteration.
+    Pipeline:
+    1. Extract connected-component segments from low-gate contours of A and B
+    2. Compute 4D spectral signature per segment
+    3. Match A→B by L2 distance in normalized signature space
+    4. Transplant matched B fragments to A's centroid locations
+    5. 90° rotation around centroids + translation toward voids
+    6. Shadow/front color transforms
+    7. Scatter-rasterize to layers + Hadamard composite
     """
     H_A, W_A, _ = image_A.shape
-    H_B, W_B, _ = image_B.shape
-    device = image_A.device
-    dtype = image_A.dtype
+    device, dtype = image_A.device, image_A.dtype
+    eff = effect_strength
 
-    # Normalize Fiedlers to [0, 1]
-    f_A_min, f_A_max = fiedler_A.min(), fiedler_A.max()
-    f_B_min, f_B_max = fiedler_B.min(), fiedler_B.max()
-    f_A_norm = (fiedler_A - f_A_min) / (f_A_max - f_A_min + 1e-8)
-    f_B_norm = (fiedler_B - f_B_min) / (f_B_max - f_B_min + 1e-8)
+    # 1. Extract segments from A
+    segments_A = extract_segments(image_A, gate_A, gate_threshold=0.5,
+                                  min_pixels=min_pixels, max_segments=max_segments)
+    if not segments_A:
+        return image_A
 
-    # Build coordinate grids for B
-    y_B = torch.arange(H_B, device=device, dtype=dtype)
-    x_B = torch.arange(W_B, device=device, dtype=dtype)
-    grid_y_B, grid_x_B = torch.meshgrid(y_B, x_B, indexing='ij')
+    # 2. Compute gate_B, extract segments from B
+    thresh_B = adaptive_threshold(fiedler_B, 40)
+    gate_B = fiedler_gate(fiedler_B, thresh_B, 10.0)
+    segments_B = extract_segments(image_B, gate_B, gate_threshold=0.5,
+                                  min_pixels=min_pixels, max_segments=max_segments * 2)
+    if not segments_B:
+        return image_A
 
-    # Flatten B's Fiedler and coordinates
-    f_B_flat = f_B_norm.flatten()
-    y_B_flat = grid_y_B.flatten()
-    x_B_flat = grid_x_B.flatten()
+    # 3. Compute spectral signatures and match
+    sigs_A = torch.stack([compute_segment_signature(s, fiedler_A) for s in segments_A])
+    sigs_B = torch.stack([compute_segment_signature(s, fiedler_B) for s in segments_B])
+    match_idx = match_segments(sigs_A, sigs_B)
 
-    # Compute bin indices for B pixels
-    bin_indices_B = (f_B_flat * (n_bins - 1)).long().clamp(0, n_bins - 1)
+    # 4. Transplant matched B segments to A's centroid locations (vectorized)
+    centroids_A = torch.stack([s.centroid for s in segments_A])
+    centroids_B = torch.stack([s.centroid for s in segments_B])
+    offsets = centroids_A - centroids_B[match_idx]
 
-    # Build lookup tables using scatter_add: mean (y, x) per spectral bin
-    y_sum = torch.zeros(n_bins, device=device, dtype=dtype)
-    x_sum = torch.zeros(n_bins, device=device, dtype=dtype)
-    count = torch.zeros(n_bins, device=device, dtype=dtype)
+    all_coords = []
+    all_colors = []
+    all_centroids = []
+    for i in range(len(segments_A)):
+        seg_B = segments_B[match_idx[i]]
+        all_coords.append(seg_B.coords + offsets[i].unsqueeze(0))
+        all_colors.append(seg_B.colors)
+        all_centroids.append(centroids_A[i].unsqueeze(0).expand(seg_B.coords.shape[0], -1))
 
-    y_sum.scatter_add_(0, bin_indices_B, y_B_flat)
-    x_sum.scatter_add_(0, bin_indices_B, x_B_flat)
-    count.scatter_add_(0, bin_indices_B, torch.ones_like(y_B_flat))
+    if not all_coords:
+        return image_A
 
-    # Mean position per bin (with fallback for empty bins)
-    valid = count > 0
-    y_mean = torch.zeros(n_bins, device=device, dtype=dtype)
-    x_mean = torch.zeros(n_bins, device=device, dtype=dtype)
-    y_mean[valid] = y_sum[valid] / count[valid]
-    x_mean[valid] = x_sum[valid] / count[valid]
+    coords = torch.cat(all_coords, dim=0)
+    colors = torch.cat(all_colors, dim=0)
+    centroids = torch.cat(all_centroids, dim=0)
 
-    # Fill empty bins with nearest valid neighbor (forward fill then backward fill)
-    for i in range(1, n_bins):
-        if not valid[i]:
-            y_mean[i] = y_mean[i-1]
-            x_mean[i] = x_mean[i-1]
-    for i in range(n_bins - 2, -1, -1):
-        if not valid[i]:
-            y_mean[i] = y_mean[i+1]
-            x_mean[i] = x_mean[i+1]
+    # 5. 90° rotation around centroids
+    rel = coords - centroids
+    rotated = torch.stack([-rel[:, 1], rel[:, 0]], dim=-1) + centroids
 
-    # Look up corresponding B position for each A pixel
-    bin_indices_A = (f_A_norm * (n_bins - 1)).long().clamp(0, n_bins - 1)
-    sample_y = y_mean[bin_indices_A.flatten()].reshape(H_A, W_A)
-    sample_x = x_mean[bin_indices_A.flatten()].reshape(H_A, W_A)
+    # 6. Translation
+    trans = translation_strength * eff
+    base_translation = torch.tensor([trans * 0.5, trans * 0.7], device=device, dtype=dtype)
+    shadow_extra = torch.tensor([shadow_offset * eff, shadow_offset * eff], device=device, dtype=dtype)
 
-    # Normalize to [-1, 1] for grid_sample
-    sample_grid = torch.stack([
-        2.0 * sample_x / (W_B - 1) - 1.0,
-        2.0 * sample_y / (H_B - 1) - 1.0
-    ], dim=-1).unsqueeze(0)
+    front_coords = rotated + base_translation.unsqueeze(0)
+    shadow_coords = rotated + base_translation.unsqueeze(0) + shadow_extra.unsqueeze(0)
 
-    # Sample B at corresponding positions
-    image_B_4d = image_B.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H_B, W_B)
-    sampled_B = torch.nn.functional.grid_sample(
-        image_B_4d, sample_grid, mode='bilinear', padding_mode='border', align_corners=True
-    ).squeeze(0).permute(1, 2, 0)  # (H_A, W_A, 3)
+    # 7. Color transforms
+    shadow_colors = compute_shadow_colors(colors, eff)
+    front_colors = compute_front_colors(colors, eff)
 
-    # Apply color transform to sampled content
-    sampled_colors = compute_front_colors(sampled_B.reshape(-1, 3), effect_strength)
-    sampled_colors = sampled_colors.reshape(H_A, W_A, 3)
+    # 8. Scatter to layers
+    shadow_layer, shadow_mask = scatter_to_layer(shadow_coords, shadow_colors, H_A, W_A)
+    front_layer, front_mask = scatter_to_layer(front_coords, front_colors, H_A, W_A)
 
-    # Composite: apply where A has low-gate contours
-    low_gate_weight = (1.0 - gate_A) * contours_A.float()
-    weight_3d = (low_gate_weight * effect_strength).unsqueeze(-1).clamp(0, 1)
+    # 9. Hadamard composite
+    segment_composite = composite_layers_hadamard(shadow_layer, shadow_mask, front_layer, front_mask)
 
-    output = image_A * (1.0 - weight_3d) + sampled_colors * weight_3d
-
-    return output
+    # 10. Blend with base image
+    combined_mask = torch.clamp(shadow_mask + front_mask, 0, 1).unsqueeze(-1)
+    return image_A * (1 - combined_mask) + segment_composite * combined_mask
 
 
 # ============================================================
@@ -865,22 +1008,13 @@ def two_image_shader_pass(
     """
     Two-image spectral shader: topology from A, content from B.
 
-    Uses cross-attention transfer per spec: phi_A @ phi_B.T gives spectral
-    correspondence. For each Fiedler value in A, sample B where fiedler_B
-    has similar value.
-
     CRITICAL: A and B can have DIFFERENT sizes. No rescaling ever.
     Graphs have spectra; rescaling destroys spectra.
 
     Pipeline:
     1. High-gate path: dilate contours on A (preserves A's structure)
-    2. Low-gate path: cross-attention transfer from B to A
-       - For each A pixel, find corresponding spectral position in B
-       - Sample B's colors there
-       - Composite onto A
-
-    No segment extraction, no connected components, no coordinate unpacking.
-    Pure tensor ops: scatter_add for binning, grid_sample for sampling.
+    2. Segment-based cross-attention: extract segments, match by spectral
+       signature, transplant B fragments to A locations, 90° rotate, scatter.
     """
     H_A, W_A, _ = image_A.shape
     device = image_A.device
@@ -903,10 +1037,14 @@ def two_image_shader_pass(
         fill_threshold=config.get('fill_threshold', 0.1)
     )
 
-    # Step 2: Cross-attention transfer from B to A (low-gate regions)
+    # Step 2: Segment-based cross-attention transfer from B to A
     output = cross_attention_transfer(
         output, image_B, fiedler_A, fiedler_B, gate_A, contours_A,
-        effect_strength=effect_strength
+        effect_strength=effect_strength,
+        shadow_offset=config.get('shadow_offset', 7.0),
+        translation_strength=config.get('translation_strength', 20.0),
+        min_pixels=config.get('min_segment_pixels', 20),
+        max_segments=config.get('max_segments', 50)
     )
 
     return output

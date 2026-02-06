@@ -6,6 +6,8 @@ This script demonstrates graph spectral attention mechanisms:
 - Self-attention: autoregressive refinement on single image
 - Cross-attention: texture transfer between image pairs
 
+Uses SpectralShader.from_config() from spectral_shader_model.py (even_cuter path).
+
 Usage:
     uv run python demo_spectral_shader.py                    # Run all demos
     uv run python demo_spectral_shader.py --self             # Self-attention only
@@ -20,8 +22,7 @@ import numpy as np
 from PIL import Image
 
 from image_io import save_image, load_image
-from spectral_shader_ops import shader_forwards, two_image_shader_pass
-from spectral_ops_fast import compute_local_eigenvectors_tiled_dither
+from spectral_shader_model import SpectralShader
 
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -48,12 +49,10 @@ BASE_CONFIG = {
 }
 
 
-def compute_fiedler(img: torch.Tensor) -> torch.Tensor:
-    """Compute Fiedler vector (2nd eigenvector of graph Laplacian)."""
-    evecs = compute_local_eigenvectors_tiled_dither(
-        img, tile_size=64, overlap=16, num_eigenvectors=4
-    )
-    return evecs[:, :, 1]
+def make_pass_model(pass_idx: int) -> SpectralShader:
+    """Build a SpectralShader configured for the given ADSR pass index."""
+    config = {**BASE_CONFIG, **ADSR_CONFIGS[min(pass_idx, len(ADSR_CONFIGS) - 1)]}
+    return SpectralShader.from_config(config).to(DEVICE)
 
 
 def run_self_attention(img_name: str, n_passes: int = 4, no_overwrite: bool = False):
@@ -75,13 +74,11 @@ def run_self_attention(img_name: str, n_passes: int = 4, no_overwrite: bool = Fa
 
     for i in range(n_passes):
         phase = ['Attack', 'Decay', 'Sustain', 'Release'][min(i, 3)]
-        config = {**BASE_CONFIG, **ADSR_CONFIGS[min(i, 3)]}
-
-        if no_overwrite:
-            config['z_buffer_mode'] = True  # Prevent overwriting existing pixels
+        model = make_pass_model(i)
 
         print(f"  Pass {i+1}/{n_passes} ({phase})")
-        result = shader_forwards(current, config=config, use_chebyshev=False)
+        # Single-image, single pass via forward()
+        result, _intermediates = model(current, n_passes=1)
         passes.append(result.clone())
 
         stem = img_name.replace('.png', '')
@@ -110,27 +107,16 @@ def run_cross_attention(target_name: str, source_name: str, n_passes: int = 4, n
     print(f"Target (A): {img_A.shape[1]}x{img_A.shape[0]}")
     print(f"Source (B): {img_B.shape[1]}x{img_B.shape[0]}")
 
-    # Precompute source Fiedler (doesn't change)
-    fiedler_B = compute_fiedler(img_B)
-
     current = img_A.clone()
     passes = []
 
     for i in range(n_passes):
         phase = ['Attack', 'Decay', 'Sustain', 'Release'][min(i, 3)]
-        config = {**BASE_CONFIG, **ADSR_CONFIGS[min(i, 3)]}
-
-        if no_overwrite:
-            config['z_buffer_mode'] = True
+        model = make_pass_model(i)
 
         print(f"  Pass {i+1}/{n_passes} ({phase})")
-
-        fiedler_current = compute_fiedler(current)
-        result = two_image_shader_pass(
-            image_A=current, image_B=img_B,
-            fiedler_A=fiedler_current, fiedler_B=fiedler_B,
-            config=config
-        )
+        # Two-image, single pass via forward()
+        result, _intermediates = model(current, image_b=img_B, n_passes=1)
         passes.append(result.clone())
 
         stem_a = target_name.replace('.png', '')

@@ -3,6 +3,7 @@
 Spectral Shader Main - Clean entry point for spectral graph operations.
 
 Composable CLI: any combination of single/paired images with any number of AR passes.
+Uses SpectralShader.from_config() from spectral_shader_model.py (even_cuter path).
 
 Examples:
     # Single image, 1 pass
@@ -20,22 +21,34 @@ Examples:
 import argparse
 import time
 from pathlib import Path
-from typing import Optional, Tuple, List
 
 import torch
 
-from spectral_shader_ops import (
-    two_image_shader_pass,
-    shader_forwards,
-    spectral_shader_pass,
-    _compute_fiedler_from_tensor,
-    adaptive_threshold,
-)
-from spectral_ops_fast import compute_local_eigenvectors_tiled_dither
+from spectral_shader_model import SpectralShader
 from image_io import save_image, load_image as _load_image
 
 
-# Default shader config
+# Quality presets based on Fiedler benchmark results
+# Lanczos-30: 0.84 correlation (quality), Lanczos-15: 0.48 (fast)
+QUALITY_PRESETS = {
+    "fast": {
+        "lanczos_iterations": 15,  # 0.48 correlation, 2x faster
+        "tile_size": 96,           # Larger tiles = fewer computations
+        "overlap": 8,              # Less overlap
+    },
+    "standard": {
+        "lanczos_iterations": 30,  # 0.84 correlation (optimal)
+        "tile_size": 64,
+        "overlap": 16,
+    },
+    "quality": {
+        "lanczos_iterations": 50,  # Ground truth
+        "tile_size": 48,           # Smaller tiles = finer detail
+        "overlap": 24,             # More overlap for smooth blending
+    },
+}
+
+# Default shader config — accepted by SpectralShader.from_config()
 DEFAULT_CONFIG = {
     "tile_size": 64,
     "overlap": 16,
@@ -48,6 +61,9 @@ DEFAULT_CONFIG = {
     "translation_strength": 15.0,
     "shadow_offset": 5.0,
     "dilation_radius": 2,
+    "lanczos_iterations": 30,  # Standard quality
+    "min_segment_pixels": 25,
+    "max_segments": 40,
 }
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -56,80 +72,6 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def load_image(path: Path) -> torch.Tensor:
     """Load image as RGB float32 [0,1] torch tensor on GPU if available."""
     return _load_image(path, device=DEVICE)
-
-
-def compute_fiedler(rgb: torch.Tensor, cfg: dict) -> torch.Tensor:
-    """Compute Fiedler vector from RGB via tiled eigenvector computation."""
-    evecs = compute_local_eigenvectors_tiled_dither(
-        rgb,
-        tile_size=cfg["tile_size"],
-        overlap=cfg["overlap"],
-        num_eigenvectors=cfg["num_eigenvectors"],
-        radii=cfg["radii"],
-        radius_weights=cfg["radius_weights"],
-        edge_threshold=cfg["edge_threshold"],
-    )
-    return evecs[:, :, 1]  # Fiedler = eigenvector index 1
-
-
-def run_shader(
-    image_a: torch.Tensor,
-    image_b: Optional[torch.Tensor],
-    fiedler_a: torch.Tensor,
-    fiedler_b: Optional[torch.Tensor],
-    config: dict,
-) -> torch.Tensor:
-    """
-    Run one shader pass. Dispatches to single or two-image based on whether B is provided.
-    """
-    if image_b is not None and fiedler_b is not None:
-        # Two-image: cross-attention transfer
-        return two_image_shader_pass(image_a, image_b, fiedler_a, fiedler_b, config)
-    else:
-        # Single image: self-shading
-        config_with_threshold = {**config, 'gate_threshold': adaptive_threshold(fiedler_a, 40.0)}
-        return spectral_shader_pass(image_a, fiedler_a, config_with_threshold)
-
-
-def run_autoregressive(
-    image_a: torch.Tensor,
-    image_b: Optional[torch.Tensor],
-    n_passes: int,
-    config: dict,
-    decay: float = 1.0,
-) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-    """
-    Autoregressive shader loop. Works for both single and two-image modes.
-
-    In two-image mode, B stays fixed while A evolves through AR passes.
-    Each pass: A' = shader(A, B) using cross-attention from B.
-    """
-    current = image_a.clone()
-    intermediates = []
-
-    # Compute Fiedler for B once (it doesn't change)
-    fiedler_b = None
-    if image_b is not None:
-        print("Computing Fiedler for source image B...")
-        fiedler_b = compute_fiedler(image_b, config)
-
-    current_config = config.copy()
-
-    for i in range(n_passes):
-        print(f"Pass {i+1}/{n_passes}...")
-
-        # Recompute Fiedler for current A (it changes each pass)
-        fiedler_a = compute_fiedler(current, config)
-
-        # Run shader
-        current = run_shader(current, image_b, fiedler_a, fiedler_b, current_config)
-        intermediates.append(current.clone())
-
-        # Apply decay
-        if decay < 1.0:
-            current_config = {**current_config, "effect_strength": current_config["effect_strength"] * decay}
-
-    return current, intermediates
 
 
 def main():
@@ -156,9 +98,21 @@ Examples:
                         help="Output path (default: auto-generated)")
     parser.add_argument("--save-intermediates", action="store_true",
                         help="Save intermediate passes")
+    parser.add_argument("-q", "--quality", choices=["fast", "standard", "quality"],
+                        default="standard",
+                        help="Quality preset: fast (2x speed), standard, quality (best)")
 
     args = parser.parse_args()
     cfg = DEFAULT_CONFIG.copy()
+
+    # Apply quality preset
+    if args.quality in QUALITY_PRESETS:
+        cfg.update(QUALITY_PRESETS[args.quality])
+        print(f"Quality preset: {args.quality}")
+
+    # Build model from config (even_cuter path)
+    model = SpectralShader.from_config(cfg).to(DEVICE)
+    print(f"Model: {model.__class__.__name__}")
 
     # Load images
     print(f"Loading {args.image_a.name}...")
@@ -175,21 +129,15 @@ Examples:
     mode = "two-image" if image_b is not None else "single-image"
     print(f"\nMode: {mode}, {args.passes} pass{'es' if args.passes > 1 else ''}")
 
-    # Run
+    # Run via SpectralShader.forward()
     start_time = time.time()
 
-    if args.passes == 1 and image_b is None:
-        # Fast path: single image, single pass
-        print("Computing Fiedler...")
-        fiedler_a = compute_fiedler(image_a, cfg)
-        print("Running shader...")
-        result = run_shader(image_a, None, fiedler_a, None, cfg)
-        intermediates = [result]
-    else:
-        # AR loop (handles both single and two-image)
-        result, intermediates = run_autoregressive(
-            image_a, image_b, args.passes, cfg, args.decay
-        )
+    result, intermediates = model(
+        image_a,
+        image_b=image_b,
+        n_passes=args.passes,
+        decay=args.decay,
+    )
 
     elapsed = time.time() - start_time
     print(f"\nTotal time: {elapsed:.2f}s ({elapsed/args.passes:.2f}s per pass)")

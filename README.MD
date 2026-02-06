@@ -103,10 +103,71 @@ These parameters can be adjusted in `demo_spectral_shader.py` or passed via conf
 
 ## Key Files
 
-- `spectral_shader_ops.py` - Core shader operations (segment extraction, copy heads, compositing)
-- `spectral_ops_fast.py` - Vectorized spectral graph operations (Laplacian, Lanczos, Fiedler)
-- `demo_spectral_shader.py` - Demo script with ADSR envelope
-- `image_io.py` - Timestamped image I/O (prevents accidental overwrites)
+| File | Role |
+|------|------|
+| `spectral_shader_model.py` | `SpectralShader` nn.Module — primary entry point (`from_config()`) |
+| `spectral_shader_layers.py` | nn.Module building blocks (gate, thicken, shadow, cross-attention) |
+| `spectral_embedding_layer.py` | `SpectralEmbedding` — tiled Lanczos Fiedler computation as nn.Module |
+| `spectral_shader_ops_cuter.py` | Functional implementation the Modules delegate to |
+| `spectral_shader_ops.py` | Original verbose implementation (retained for regression tests) |
+| `spectral_ops_fast.py` | Numerical kernel (Laplacian construction, Lanczos iteration, tiled eigenvectors) |
+| `demo_spectral_shader.py` | Demo script with ADSR envelope |
+| `spectral_shader_main.py` | Composable CLI (single/paired images, AR passes, quality presets) |
+| `image_io.py` | Timestamped image I/O (prevents accidental overwrites) |
+
+Both `spectral_shader_main.py` and `demo_spectral_shader.py` use `SpectralShader.from_config()`.
+
+## Performance: Reference vs Module Path
+
+Benchmark on 20 pairs of 512x512 structured textures, each pair processed through one
+self-attention pass + one cross-attention pass (CUDA, RTX-class GPU):
+
+| | Total (20 pairs) | Per pair | Per image |
+|---|---|---|---|
+| **Fiedler only** | 107.2s | — | 2679 ms |
+| **Reference** (`spectral_shader_ops.shader_forwards`) | 136.3s | 6813 ms | — |
+| **Module** (`SpectralShader.from_config().forward`) | 114.2s | 5708 ms | — |
+
+The nn.Module path (`spectral_shader_model.py`) is **16% faster** than calling
+`spectral_shader_ops.py` functions directly (1.19x speedup). Both produce
+**bit-exact identical output** (verified by e2e regression tests, 0.000000 mean
+absolute difference).
+
+### Fused kernels
+
+The Module path benefits from several fused operations in `SpectralEmbedding` that
+the reference path does not use:
+
+| Fusion | What it does | Savings |
+|--------|-------------|---------|
+| **Fused Lanczos recurrence** | 3-term recurrence absorbed into reorthogonalization; alpha extracted from projection coefficients | ~60 kernel launches/tile |
+| **Pre-computed Laplacian offsets** | Multi-radius neighbor offsets computed once in `__init__`, stored as buffers | Eliminates ~169-iter Python loop per tile |
+| **Pointer-jumping connected components** | O(log diameter) iterations instead of O(diameter); vectorized 4-direction min | ~3x fewer iterations |
+| **Batched blend accumulation** | Single `evecs * blend.unsqueeze(-1)` instead of per-eigenvector loop | k kernel launches → 1 |
+| **Inline spectral complexity** | Reuses pre-computed Sobel gx/gy instead of recomputing inside dilation | Eliminates redundant Sobel pass |
+| **Vectorized segment transplant** | Pre-computed centroid offsets as tensor ops, no `.item()` CPU syncs | Eliminates per-segment CPU roundtrip |
+
+### Where the time goes
+
+```
+Fiedler eigenvector computation    94%   ← tiled Lanczos (spectral_embedding_layer.py)
+Shader ops (gate/thicken/shadow)    5%   ← segment extract, match, rotate, composite
+Module dispatch + Python/CUDA       1%
+```
+
+The Fiedler bottleneck dominates: each 512x512 image requires ~2.7s for tiled Lanczos
+(121 tiles at 64x64 with 16px overlap, 30 iterations each). A self+cross pair computes
+3 Fiedler vectors (1 for self, 2 for cross), accounting for the majority of per-pair cost.
+
+### Implications
+
+- **Module path is the correct default.** It is faster than the reference path thanks to
+  fused kernels, and buys nn.Module composability, `torch.compile` compatibility on
+  shader submodules, and a clean `forward()` API.
+- **Optimization effort belongs in the Fiedler computation**, not the shader ops.
+  Cutting Lanczos from 30 to 15 iterations halves the Fiedler time at 0.48 correlation
+  (vs 0.84 at 30 iters) — use `-q fast` in `spectral_shader_main.py` for this tradeoff.
+- The reference path (`spectral_shader_ops.py`) is retained for regression testing only.
 
 ## Technical Details
 
