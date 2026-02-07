@@ -25,7 +25,7 @@ When an image "attends to itself," the shader:
 - Thickens contours based on local spectral complexity
 - Iteratively refines over multiple ADSR-envelope controlled passes
 
-![Self-attention progression](demo_output/readme_self_attention.png)
+![Self-attention progression](docs/images/readme_self_attention.png)
 
 The progression shows feature accretion from the same source: existing structure propagates and densifies without external input. Color distortion is minimal because source and target share the same palette.
 
@@ -36,7 +36,7 @@ When image A (target) attends to image B (source):
 - B provides **content**: WHAT pixels/colors to actually copy
 - Spectral signatures match segments across images despite different sizes
 
-![Cross-attention: toof x 1bit](demo_output/readme_cross_attention.png)
+![Cross-attention: toof x 1bit](docs/images/readme_cross_attention.png)
 
 The color distortion filter reveals which visual properties come from which source:
 - Structure/position: from target (A)
@@ -46,7 +46,7 @@ The color distortion filter reveals which visual properties come from which sour
 
 The same target topology with different source textures:
 
-![Source comparison](demo_output/readme_source_comparison.png)
+![Source comparison](docs/images/readme_source_comparison.png)
 
 ## Z-Buffer Mode (Sum Contributions)
 

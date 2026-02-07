@@ -68,3 +68,7 @@ hypercontexts
 # Input images are tracked (small, curated test set)
 !input_images/
 !input_images/**
+
+# Docs images are tracked (canonical README/demo screenshots)
+!docs/
+!docs/**
