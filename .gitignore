@@ -39,6 +39,7 @@ uv.lock
 
 # Demo output subdirectories (generated, large)
 demo_output/*/
+demo_output/*.*
 
 # But keep demo_output dir itself for structure
 !demo_output/.gitkeep

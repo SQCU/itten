@@ -231,8 +231,16 @@ class SpectralShader(nn.Module):
         embedding: SpectralEmbedding,
         self_shader: SpectralShaderBlock,
         cross_shader: SpectralCrossAttentionBlock,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
+
+        # Mixed-precision: compute_dtype controls Zone B (shader ops, image I/O).
+        # Zone A (Lanczos iteration inside SpectralEmbedding) always runs float32.
+        # The Fiedler vector exits Zone A as float32 and is cast to compute_dtype
+        # at the boundary. All downstream shader ops inherit compute_dtype.
+        # Default float32 = no-op (bit-exact with prior behavior).
+        self.compute_dtype = compute_dtype
 
         # Core submodules
         self.embedding = embedding
@@ -267,7 +275,17 @@ class SpectralShader(nn.Module):
         """
         cfg = config.copy() if config else {}
 
+        # Mixed-precision dtype for Zone B (shader ops).
+        # Accepts torch.dtype or string ("float32", "bfloat16").
+        compute_dtype_raw = cfg.get("compute_dtype", torch.float32)
+        if isinstance(compute_dtype_raw, str):
+            compute_dtype = getattr(torch, compute_dtype_raw)
+        else:
+            compute_dtype = compute_dtype_raw
+
         # P1: SpectralEmbedding — implicit layer (Lanczos iteration)
+        # output_dtype = compute_dtype: Fiedler exits Zone A as float32,
+        # cast to compute_dtype at the boundary.
         embedding = SpectralEmbedding(
             tile_size=cfg.get("tile_size", 64),
             overlap=cfg.get("overlap", 16),
@@ -276,6 +294,7 @@ class SpectralShader(nn.Module):
             radius_weights=cfg.get("radius_weights", [1.0, 0.6, 0.4, 0.3, 0.2, 0.1]),
             edge_threshold=cfg.get("edge_threshold", 0.15),
             lanczos_iterations=cfg.get("lanczos_iterations", 30),
+            output_dtype=compute_dtype,
         )
 
         # P0: SpectralShaderBlock — single-image pipeline (gate + thicken + shadow)
@@ -284,7 +303,7 @@ class SpectralShader(nn.Module):
         # P0 + cross-attention: two-image pipeline (thicken + cross-attention)
         cross_shader = SpectralCrossAttentionBlock(cfg)
 
-        return cls(embedding, self_shader, cross_shader)
+        return cls(embedding, self_shader, cross_shader, compute_dtype=compute_dtype)
 
     def forward(
         self,
@@ -326,7 +345,13 @@ class SpectralShader(nn.Module):
         """
         intermediates: List[torch.Tensor] = []
 
+        # Zone B entry: cast images to compute_dtype (bfloat16 or float32).
+        # The embedding layer internally runs Lanczos in float32 (Zone A)
+        # and casts its output to compute_dtype via output_dtype.
+        image_a = image_a.to(dtype=self.compute_dtype)
+
         if image_b is not None:
+            image_b = image_b.to(dtype=self.compute_dtype)
             # Two-image mode: cross-attention transfer
             # Source embedding is computed ONCE — source is never mutated.
             source_fiedler = self.embedding(image_b)
@@ -363,6 +388,9 @@ class SpectralShader(nn.Module):
             # across calls)
             self.cross_shader.effect_strength = original_effect
 
+            # Zone B exit: cast back to float32 for I/O (PIL/save_image expect float32).
+            return current.float(), [i.float() for i in intermediates]
+
         else:
             # Single-image mode: self-shading
             current = image_a
@@ -390,7 +418,8 @@ class SpectralShader(nn.Module):
             self.self_shader.effect_strength = original_effect
             self.self_shader.shadow.effect_strength = original_effect
 
-        return current, intermediates
+        # Zone B exit: cast back to float32 for I/O (PIL/save_image expect float32).
+        return current.float(), [i.float() for i in intermediates]
 
     def forward_single_pass(
         self,
@@ -420,26 +449,37 @@ class SpectralShader(nn.Module):
         Returns:
             (H, W, 3) processed image.
         """
+        # Zone B entry: cast to compute_dtype
+        image = image.to(dtype=self.compute_dtype)
+
         if fiedler is None:
             fiedler = self.embedding(image)
+        else:
+            fiedler = fiedler.to(dtype=self.compute_dtype)
 
         if image_b is not None:
+            image_b = image_b.to(dtype=self.compute_dtype)
             if fiedler_b is None:
                 fiedler_b = self.embedding(image_b)
+            else:
+                fiedler_b = fiedler_b.to(dtype=self.compute_dtype)
+            # Zone B exit: cast back to float32
             return self.cross_shader(
                 image, fiedler, source=image_b, source_fiedler=fiedler_b
-            )
+            ).float()
         else:
-            return self.self_shader(image, fiedler)
+            return self.self_shader(image, fiedler).float()
 
     def __repr__(self) -> str:
         """Readable summary of the model graph."""
         lines = [
             f"{self.__class__.__name__}(",
+            f"  compute_dtype={self.compute_dtype},",
             f"  embedding: {self.embedding.__class__.__name__}("
             f"tile_size={self.embedding.tile_size}, "
             f"overlap={self.embedding.overlap}, "
-            f"lanczos_iter={self.embedding.lanczos_iterations})",
+            f"lanczos_iter={self.embedding.lanczos_iterations}, "
+            f"output_dtype={self.embedding.output_dtype})",
             f"  self_shader: {self.self_shader.__class__.__name__}("
             f"gate_sharpness={self.self_shader.gate.sharpness}, "
             f"effect={self.self_shader.effect_strength})",

@@ -5,16 +5,17 @@ import math
 from typing import Dict, Tuple, Optional, List, Callable
 from dataclasses import dataclass
 
-# Module-level cached Sobel kernels
+# Module-level cached Sobel kernels (keyed by device + dtype)
 _SOBEL_XY: Optional[torch.Tensor] = None
 _SOBEL_DEVICE: Optional[torch.device] = None
+_SOBEL_DTYPE: Optional[torch.dtype] = None
 
 def _get_sobel_kernels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    global _SOBEL_XY, _SOBEL_DEVICE
-    if _SOBEL_XY is None or _SOBEL_DEVICE != device:
+    global _SOBEL_XY, _SOBEL_DEVICE, _SOBEL_DTYPE
+    if _SOBEL_XY is None or _SOBEL_DEVICE != device or _SOBEL_DTYPE != dtype:
         sx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=dtype) / 8.0
         sy = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=device, dtype=dtype) / 8.0
-        _SOBEL_XY, _SOBEL_DEVICE = torch.stack([sx, sy]).unsqueeze(1), device
+        _SOBEL_XY, _SOBEL_DEVICE, _SOBEL_DTYPE = torch.stack([sx, sy]).unsqueeze(1), device, dtype
     return _SOBEL_XY
 
 @torch.compile
@@ -39,7 +40,11 @@ def detect_contours(gray: torch.Tensor, threshold: float = 1.0) -> torch.Tensor:
     return torch.abs((gray - gray.mean()) / (gray.std() + 1e-8)) > threshold
 
 def adaptive_threshold(fiedler: torch.Tensor, percentile: float = 40.0) -> torch.Tensor:
-    return torch.quantile(fiedler.flatten(), percentile / 100.0)
+    # torch.quantile requires float32/64; upcast if bfloat16, result cast back
+    flat = fiedler.flatten()
+    if flat.dtype not in (torch.float32, torch.float64):
+        return torch.quantile(flat.float(), percentile / 100.0).to(dtype=flat.dtype)
+    return torch.quantile(flat, percentile / 100.0)
 
 @torch.compile
 def fill_empty_bins(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -413,9 +418,17 @@ def cross_attention_transfer(img_A: torch.Tensor, img_B: torch.Tensor, f_A: torc
     # 9. Hadamard composite
     segment_composite = composite_layers_hadamard(shadow_layer, shadow_mask, front_layer, front_mask)
 
-    # 10. Blend with base image where segments exist
+    # 10. Underpaint: only deposit fragments into void regions of the target.
+    # gate_A encodes the graph's view of content vs void:
+    #   gate < 0.5 = content (markings, structure) -> preserve
+    #   gate >= 0.5 = void (negative space) -> safe to write
+    # This ensures transplanted fragments appear "below" existing structure,
+    # like z-buffering: new deposits never overwrite what the graph considers
+    # to be part of the image. (ref: v8 preserve, v10 scatter_patch)
     combined_mask = torch.clamp(shadow_mask + front_mask, 0, 1).unsqueeze(-1)
-    return img_A * (1 - combined_mask) + segment_composite * combined_mask
+    void_A = (gate_A >= 0.5).float().unsqueeze(-1)
+    effective_mask = combined_mask * void_A
+    return img_A * (1 - effective_mask) + segment_composite * effective_mask
 
 def shader_pass_fused(img: torch.Tensor, fiedler: torch.Tensor, cfg: Dict) -> torch.Tensor:
     gray = to_grayscale(img)

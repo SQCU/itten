@@ -211,11 +211,11 @@ class SpectralThickening(nn.Module):
 
         # cuter:99-100 - high-gate contour mask and presence flag
         hgc = contours & (gate > self.high_gate_threshold)
-        has_c = hgc.any().float()
+        has_c = hgc.any().to(dtype=dtype)
 
         # cuter:101-102 - inverse complexity modulation
         cplx = compute_local_spectral_complexity(fiedler, self.complexity_window)
-        wt = hgc.float() * (1.0 - mod * cplx).clamp(min=0.05)
+        wt = hgc.to(dtype=dtype) * (1.0 - mod * cplx).clamp(min=0.05)
 
         # cuter:104-108 - Gaussian convolution of the weighted mask
         kern = self._ensure_kernel(r, device, dtype)
@@ -226,7 +226,7 @@ class SpectralThickening(nn.Module):
 
         # cuter:110-111 - fill mask: non-contour pixels where selection > threshold
         fill = (~contours) & (sel > fill_th)
-        has_f = fill.any().float()
+        has_f = fill.any().to(dtype=dtype)
 
         # cuter:113-116 - gradient of selection map -> displacement direction
         mgy = F.pad(sel[1:, :] - sel[:-1, :], (0, 0, 0, 1))
@@ -266,7 +266,7 @@ class SpectralThickening(nn.Module):
         samp_rgb = samp.squeeze(0).permute(1, 2, 0)
 
         # cuter:128-129 - composite with hard gate threshold
-        g3 = (fill.float() * (sel > 0.2).float()).unsqueeze(-1)
+        g3 = (fill.to(dtype=dtype) * (sel > 0.2).to(dtype=dtype)).unsqueeze(-1)
         result = torch.lerp(img, samp_rgb, g3)
 
         # cuter:130 - guard: no-op if no contours or no fill pixels
@@ -343,8 +343,8 @@ class SpectralShadow(nn.Module):
         trans = self.translation_strength * eff
 
         # cuter:139-140 - low-gate weight and presence check
-        lgw = (1.0 - gate) * contours.float()
-        has_m = (lgw.sum() >= 10).float()
+        lgw = (1.0 - gate) * contours.to(dtype=dtype)
+        has_m = (lgw.sum() >= 10).to(dtype=dtype)
 
         # cuter:20-25 (via compute_gradient_xy) - Fiedler gradient
         # We use the registered Sobel buffers instead of the global cache.

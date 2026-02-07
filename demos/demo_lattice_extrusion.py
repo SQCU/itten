@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""Demo 2: Lattice Extrusion — Phase E of demo recovery.
+"""Demo: Lattice Extrusion as Edge-Based Height Field on Egg Surface.
 
-Composition chain:
-    base graph -> spectral analysis -> lattice selection -> extrusion -> 3D visualization
+Three lattice types (triangular, square, hexagonal) wrapped on an egg surface,
+extruded iteratively to create high-dimensional structure, rendered as:
+  - Positive bumps at node positions
+  - Negative channels along edge paths
+  - Height field -> normal map -> lit 3D egg surface
 
-Demonstrates:
-1. Build a base graph with interesting spectral variation (islands + bridge).
-2. Run ExpansionGatedExtruder at multiple theta values to show different lattice types.
-3. Verify 3+ non-isomorphic lattice types appear (square, triangle, hex).
-4. Visualize the extruded graph as a 3D surface via EggSurfaceRenderer.
-5. Show which regions got which lattice type.
+The key insight: edges are lines (many pixels), nodes are points (one pixel).
+Map edge directions to tangent-plane directions, render as bump/channel texture.
+Different lattice types produce visibly different channel hatching patterns.
 
 Uses ONLY the _even_cuter Module files:
-- spectral_graph_embedding.py: GraphEmbedding
-- spectral_lattice.py: ExpansionGatedExtruder, LatticeTypeSelector,
-                        build_islands_bridge_graph, build_grid_graph
+- spectral_lattice.py: build_egg_lattice, edges_to_height_field, lattice_type_texture
 - spectral_renderer.py: HeightToNormals, EggSurfaceRenderer
 - image_io.py: save_image
-
-Zero imports from spectral_ops_fast.py or spectral_ops_fns.py.
 """
 
 import sys
@@ -26,443 +22,277 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
+import json
 import time
 from pathlib import Path
-from typing import Tuple
 
 import torch
 
-from spectral_graph_embedding import GraphEmbedding
 from spectral_lattice import (
-    ExpansionGatedExtruder,
-    LatticeTypeSelector,
-    build_islands_bridge_graph,
-    build_grid_graph,
+    build_egg_lattice,
+    edges_to_height_field,
+    lattice_type_texture,
+    compute_degrees,
 )
 from spectral_renderer import HeightToNormals, EggSurfaceRenderer
 from image_io import save_image
 
 
-# Lattice type names for display
-LATTICE_NAMES = {0: "square", 1: "triangle", 2: "hex"}
-
-
-def graph_to_height_image(
-    coords: torch.Tensor,
-    node_properties: torch.Tensor,
-    resolution: int = 128,
-    value_column: int = 3,
-) -> torch.Tensor:
-    """Rasterize graph nodes into a 2D height-field image.
-
-    Maps 3D node coordinates to a 2D image where pixel intensity encodes the
-    chosen node property (default: node_value from column 3 of node_properties).
-
-    For nodes with z > 0 (extruded layers), the height value is accumulated
-    to show the layered structure.
-
-    Args:
-        coords: (m, 3) node positions (x, y, z).
-        node_properties: (m, 4) per-node metadata.
-        resolution: Output image resolution.
-        value_column: Which column of node_properties to use as intensity.
-
-    Returns:
-        (resolution, resolution) float32 height field in [0, 1].
-    """
-    device = coords.device
-    m = coords.shape[0]
-
-    # Get 2D bounding box of all nodes
-    x_min, x_max = coords[:, 0].min().item(), coords[:, 0].max().item()
-    y_min, y_max = coords[:, 1].min().item(), coords[:, 1].max().item()
-
-    # Add margin
-    x_range = max(x_max - x_min, 1.0)
-    y_range = max(y_max - y_min, 1.0)
-    margin = max(x_range, y_range) * 0.1
-    x_min -= margin
-    x_max += margin
-    y_min -= margin
-    y_max += margin
-    x_range = x_max - x_min
-    y_range = y_max - y_min
-
-    # Map node positions to pixel coordinates
-    px = ((coords[:, 0] - x_min) / x_range * (resolution - 1)).long().clamp(0, resolution - 1)
-    py = ((coords[:, 1] - y_min) / y_range * (resolution - 1)).long().clamp(0, resolution - 1)
-
-    # Accumulate values and counts
-    height = torch.zeros((resolution, resolution), device=device, dtype=torch.float32)
-    counts = torch.zeros((resolution, resolution), device=device, dtype=torch.float32)
-
-    # Node values: use the requested column, plus layer index for height variation
-    values = node_properties[:, value_column]
-    layer_boost = node_properties[:, 0] * 0.15  # Layer index adds height
-    combined = (values + layer_boost).clamp(0.0, 1.5)
-
-    # Scatter nodes into the image
-    for i in range(m):
-        xi, yi = px[i].item(), py[i].item()
-        height[yi, xi] += combined[i].item()
-        counts[yi, xi] += 1.0
-
-    # Average where multiple nodes land on same pixel
-    valid = counts > 0
-    height[valid] = height[valid] / counts[valid]
-
-    # Fill gaps with a simple dilation (nearest-neighbor spread)
-    filled = height.clone()
-    for _ in range(3):
-        padded = torch.nn.functional.pad(filled.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode="replicate")
-        kernel = torch.ones((1, 1, 3, 3), device=device) / 9.0
-        smoothed = torch.nn.functional.conv2d(padded, kernel).squeeze()
-        # Only fill where we have no data
-        empty = counts == 0
-        filled[empty] = smoothed[empty]
-
-    # Normalize to [0, 1]
-    fmin, fmax = filled.min(), filled.max()
-    if fmax > fmin:
-        filled = (filled - fmin) / (fmax - fmin)
-
-    return filled
-
-
-def graph_to_lattice_type_image(
-    coords: torch.Tensor,
-    node_properties: torch.Tensor,
-    resolution: int = 128,
-) -> torch.Tensor:
-    """Rasterize graph nodes into an RGB image color-coded by lattice type.
-
-    Colors:
-    - Square (0): blue [0.2, 0.4, 0.9]
-    - Triangle (1): red [0.9, 0.2, 0.2]
-    - Hex (2): green [0.2, 0.9, 0.3]
-
-    Args:
-        coords: (m, 3) node positions.
-        node_properties: (m, 4) per-node metadata (column 1 = lattice type).
-        resolution: Output image resolution.
-
-    Returns:
-        (resolution, resolution, 3) float32 RGB image in [0, 1].
-    """
-    device = coords.device
-    m = coords.shape[0]
-
-    # Color map for lattice types
-    colors = torch.tensor([
-        [0.2, 0.4, 0.9],   # square = blue
-        [0.9, 0.2, 0.2],   # triangle = red
-        [0.2, 0.9, 0.3],   # hex = green
-    ], device=device, dtype=torch.float32)
-
-    # Get 2D bounding box
-    x_min, x_max = coords[:, 0].min().item(), coords[:, 0].max().item()
-    y_min, y_max = coords[:, 1].min().item(), coords[:, 1].max().item()
-    x_range = max(x_max - x_min, 1.0)
-    y_range = max(y_max - y_min, 1.0)
-    margin = max(x_range, y_range) * 0.1
-    x_min -= margin
-    x_max += margin
-    y_min -= margin
-    y_max += margin
-    x_range = x_max - x_min
-    y_range = y_max - y_min
-
-    # Map to pixel coords
-    px = ((coords[:, 0] - x_min) / x_range * (resolution - 1)).long().clamp(0, resolution - 1)
-    py = ((coords[:, 1] - y_min) / y_range * (resolution - 1)).long().clamp(0, resolution - 1)
-
-    # Initialize with dark background
-    img = torch.ones((resolution, resolution, 3), device=device, dtype=torch.float32) * 0.1
-
-    # Paint each node with its lattice type color
-    lattice_types = node_properties[:, 1].long().clamp(0, 2)
-    for i in range(m):
-        xi, yi = px[i].item(), py[i].item()
-        lt = lattice_types[i].item()
-        # Brightness modulated by layer
-        layer = node_properties[i, 0].item()
-        brightness = 0.6 + 0.4 * min(layer / 3.0, 1.0)
-        img[yi, xi] = colors[lt] * brightness
-
-    # Dilate slightly to make nodes visible
-    for _ in range(2):
-        padded = torch.nn.functional.pad(
-            img.permute(2, 0, 1).unsqueeze(0), (1, 1, 1, 1), mode="replicate"
-        )
-        kernel = torch.ones((1, 1, 3, 3), device=device) / 9.0
-        for c in range(3):
-            smoothed = torch.nn.functional.conv2d(
-                padded[:, c:c+1], kernel
-            ).squeeze()
-            dark = img[:, :, c] < 0.15
-            img[:, :, c] = torch.where(dark, smoothed, img[:, :, c])
-
-    return img.clamp(0.0, 1.0)
-
-
-def run_extrusion_at_theta(
-    adjacency: torch.Tensor,
-    coords: torch.Tensor,
-    theta: float,
-    extruder: ExpansionGatedExtruder,
-    label: str,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """Run a single extrusion at a given theta value and collect statistics.
-
-    Returns:
-        Tuple of (extruded_coords, extruded_adj, node_properties, stats_dict)
-    """
-    t0 = time.time()
-    ext_coords, ext_adj, ext_props = extruder(adjacency, coords, theta=theta)
-    elapsed = time.time() - t0
-
-    m = ext_coords.shape[0]
-    n_base = coords.shape[0]
-    layers = torch.unique(ext_props[:, 0])
-    lattice_types = ext_props[:, 1].long()
-    type_counts = {}
-    for tid in range(3):
-        count = (lattice_types == tid).sum().item()
-        type_counts[LATTICE_NAMES[tid]] = count
-
-    stats = {
-        "theta": theta,
-        "label": label,
-        "base_nodes": n_base,
-        "total_nodes": m,
-        "extruded_nodes": m - n_base,
-        "layers": layers.tolist(),
-        "num_layers": len(layers),
-        "type_counts": type_counts,
-        "elapsed": elapsed,
-    }
-
-    return ext_coords, ext_adj, ext_props, stats
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Demo 2: Lattice Extrusion — iterative spectral-gated extrusion with 3+ non-isomorphic lattice types"
+        description="Lattice Extrusion: Edge-Based Height Field on Egg Surface"
     )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("demo_output"),
-        help="Output directory (default: demo_output/)"
-    )
-    parser.add_argument(
-        "--resolution", type=int, default=256,
-        help="Visualization resolution (default: 256)"
-    )
-    parser.add_argument(
-        "--egg-resolution", type=int, default=512,
-        help="Egg render resolution (default: 512)"
-    )
-    parser.add_argument(
-        "--island-radius", type=int, default=4,
-        help="Radius of each island (default: 4)"
-    )
-    parser.add_argument(
-        "--bridge-length", type=int, default=6,
-        help="Length of the bridge between islands (default: 6)"
-    )
-    parser.add_argument(
-        "--device", type=str, default=None,
-        help="Device: 'cpu' or 'cuda' (default: auto-detect)"
-    )
+    parser.add_argument("--output-dir", type=Path, default=Path("demo_output"))
+    parser.add_argument("--tex-res", type=int, default=256,
+                        help="Texture resolution (default: 256)")
+    parser.add_argument("--egg-res", type=int, default=512,
+                        help="Egg render resolution (default: 512)")
+    parser.add_argument("--grid-size", type=int, default=14,
+                        help="Lattice grid size per patch (default: 14)")
+    parser.add_argument("--layers", type=int, default=6,
+                        help="Extrusion layers per lattice type (default: 6)")
+    parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
-    # Device selection
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device) if args.device else (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
+    out = args.output_dir
+    out.mkdir(parents=True, exist_ok=True)
+    tex_res = args.tex_res
+    egg_res = args.egg_res
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    stats = {}
+
     print(f"Device: {device}")
+    print(f"Texture: {tex_res}x{tex_res}, Egg: {egg_res}x{egg_res}")
+    print(f"Grid: {args.grid_size}, Layers: {args.layers}")
+    print()
 
-    # Output directory
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    total_start = time.time()
-
-    # ===================================================================
-    # Step 1: Create base graph
-    # ===================================================================
-    print("[1/6] Building islands-bridge graph...")
+    # ================================================================
+    # Phase 1: Build lattice graph on egg surface
+    # ================================================================
+    print("Phase 1: Building lattice graph...")
     t0 = time.time()
 
-    adjacency, coords = build_islands_bridge_graph(
-        island_radius=args.island_radius,
-        bridge_length=args.bridge_length,
-        bridge_width=1,
+    lattice = build_egg_lattice(
+        grid_size=args.grid_size,
+        n_extrusion_layers=args.layers,
+        jitter_scale=0.012,
         device=device,
     )
-    n = coords.shape[0]
-    n_edges = adjacency._nnz()
+
     t1 = time.time()
-    print(f"       Graph: {n} nodes, {n_edges} edges")
-    print(f"       Coord range: x=[{coords[:, 0].min():.0f}, {coords[:, 0].max():.0f}], "
-          f"y=[{coords[:, 1].min():.0f}, {coords[:, 1].max():.0f}]")
-    print(f"       Time: {t1 - t0:.3f}s")
+    stats["phase1_build"] = {
+        "n_nodes": lattice["n"],
+        "n_edges": lattice["n_edges"],
+        "seed_counts": {k: v for k, v in lattice["seed_counts"].items()},
+        "extruded_counts": {k: v for k, v in lattice["extruded_counts"].items()},
+        "n_extrusion_layers": lattice["n_extrusion_layers"],
+        "n_distinct_edge_directions": lattice["n_distinct_directions"],
+        "degree_range": [int(lattice["degrees"].min().item()),
+                         int(lattice["degrees"].max().item())],
+        "degree_mean": round(lattice["degrees"].mean().item(), 1),
+        "time_s": round(t1 - t0, 3),
+    }
+    print(f"  {lattice['n']} nodes, {lattice['n_edges']} edges")
+    print(f"  Seeds: tri={lattice['seed_counts']['tri']}, "
+          f"sq={lattice['seed_counts']['sq']}, hex={lattice['seed_counts']['hex']}")
+    print(f"  Extruded: tri={lattice['extruded_counts']['tri']}, "
+          f"sq={lattice['extruded_counts']['sq']}, hex={lattice['extruded_counts']['hex']}")
+    print(f"  Distinct edge directions: {lattice['n_distinct_directions']}")
+    print(f"  Degree range: [{int(lattice['degrees'].min())}, {int(lattice['degrees'].max())}], "
+          f"mean={lattice['degrees'].mean():.1f}")
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-    # ===================================================================
-    # Step 2: Set up extruder
-    # ===================================================================
-    print("\n[2/6] Initializing extruder modules...")
-    t2 = time.time()
+    # ================================================================
+    # Phase 2: Generate height field from edges
+    # ================================================================
+    print("Phase 2: Generating height field...")
+    t0 = time.time()
 
-    graph_embedding = GraphEmbedding(
-        num_eigenvectors=4,
-        lanczos_iterations=20,
-    ).to(device)
+    height_field = edges_to_height_field(
+        lattice["adj"], lattice["uv"], lattice["n"],
+        tex_res=tex_res,
+        bump_height=1.5,
+        bump_sigma=2.0,
+        channel_depth=-0.5,
+        device=device,
+    )
 
-    lattice_selector = LatticeTypeSelector(
-        high_threshold=0.60,
-        low_threshold=0.40,
-    ).to(device)
+    t1 = time.time()
+    stats["phase2_height_field"] = {
+        "resolution": tex_res,
+        "height_min": round(height_field.min().item(), 4),
+        "height_max": round(height_field.max().item(), 4),
+        "height_mean": round(height_field.mean().item(), 4),
+        "height_std": round(height_field.std().item(), 4),
+        "nonzero_frac": round((height_field.abs() > 1e-4).float().mean().item(), 4),
+        "time_s": round(t1 - t0, 3),
+    }
+    print(f"  Height range: [{height_field.min():.3f}, {height_field.max():.3f}]")
+    print(f"  Nonzero: {(height_field.abs() > 1e-4).float().mean() * 100:.1f}%")
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-    extruder = ExpansionGatedExtruder(
-        graph_embedding=graph_embedding,
-        lattice_selector=lattice_selector,
-        expansion_threshold=0.5,
-        max_layers=3,
-        hop_radius=2,
-    ).to(device)
+    # Save height field as grayscale image
+    h_norm = height_field - height_field.min()
+    h_norm = h_norm / h_norm.max().clamp(min=1e-6)
+    h_rgb = h_norm.unsqueeze(-1).expand(-1, -1, 3)
+    save_image(h_rgb, out / f"lattice_height_field_{ts}.png", timestamp=False)
 
-    t3 = time.time()
-    print(f"       Time: {t3 - t2:.3f}s")
+    # ================================================================
+    # Phase 3: Generate color texture from lattice types
+    # ================================================================
+    print("Phase 3: Generating type texture...")
+    t0 = time.time()
 
-    # ===================================================================
-    # Step 3: Run extrusion at multiple theta values
-    # ===================================================================
-    print("\n[3/6] Running extrusions at multiple theta values...")
+    color_tex = lattice_type_texture(
+        lattice["uv"], lattice["types"], lattice["n"],
+        tex_res=tex_res, device=device,
+    )
 
-    theta_values = [0.0, 0.3, 0.5, 0.7, 1.0]
-    all_results = []
-    all_lattice_types_seen = set()
+    t1 = time.time()
+    save_image(color_tex, out / f"lattice_type_texture_{ts}.png", timestamp=False)
+    stats["phase3_type_texture"] = {"time_s": round(t1 - t0, 3)}
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-    for theta in theta_values:
-        label = f"theta={theta:.1f}"
-        print(f"\n  --- {label} ---")
+    # ================================================================
+    # Phase 4: Height -> Normals
+    # ================================================================
+    print("Phase 4: Computing normal map...")
+    t0 = time.time()
 
-        ext_coords, ext_adj, ext_props, stats = run_extrusion_at_theta(
-            adjacency, coords, theta, extruder, label
-        )
-        all_results.append((ext_coords, ext_adj, ext_props, stats))
+    h2n = HeightToNormals(strength=3.0).to(device)
+    normal_map = h2n(height_field)  # (tex_res, tex_res, 3)
 
-        # Track which lattice types we've seen
-        for name, count in stats["type_counts"].items():
-            if count > 0:
-                all_lattice_types_seen.add(name)
+    t1 = time.time()
+    save_image(normal_map, out / f"lattice_normal_map_{ts}.png", timestamp=False)
+    stats["phase4_normals"] = {"time_s": round(t1 - t0, 3)}
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-        print(f"       Nodes: {stats['base_nodes']} base -> {stats['total_nodes']} total "
-              f"(+{stats['extruded_nodes']} extruded)")
-        print(f"       Layers: {stats['num_layers']} ({stats['layers']})")
-        print(f"       Lattice types: {stats['type_counts']}")
-        print(f"       Time: {stats['elapsed']:.3f}s")
+    # ================================================================
+    # Phase 5: Egg surface render with lattice texture
+    # ================================================================
+    print("Phase 5: Rendering egg surface...")
+    t0 = time.time()
 
-    # ===================================================================
-    # Step 4: Verify 3+ non-isomorphic lattice types
-    # ===================================================================
-    print("\n[4/6] Verifying non-isomorphic lattice types...")
-    print(f"       Types seen across all theta values: {sorted(all_lattice_types_seen)}")
-    num_types = len(all_lattice_types_seen)
-    if num_types >= 3:
-        print(f"       PASS: {num_types} non-jointly-isomorphic lattice types confirmed")
-        print("       (Square: degree 4, girth 4 | Triangle: degree 6, girth 3 | Hex: degree 3, girth 6)")
-    else:
-        print(f"       NOTE: Only {num_types} types seen. Adjusting thresholds may reveal more.")
-        print("       The LatticeTypeSelector guarantees all 3 types are reachable;")
-        print("       specific graph topology may concentrate on fewer types.")
-
-    # ===================================================================
-    # Step 5: Visualize extruded graphs
-    # ===================================================================
-    print(f"\n[5/6] Visualizing extruded graphs (resolution={args.resolution})...")
-
-    height_to_normals = HeightToNormals(strength=3.0).to(device)
-    egg_renderer = EggSurfaceRenderer(
-        resolution=args.egg_resolution,
+    egg = EggSurfaceRenderer(
+        resolution=egg_res,
         egg_factor=0.25,
         bump_strength=1.5,
         light_dir=(0.5, 0.7, 1.0),
+        specular_power=32.0,
+        fresnel_ior=1.5,
+        ambient=0.08,
     ).to(device)
 
-    # Pick 3 representative theta values for visualization
-    vis_indices = [0, 2, 4]  # theta = 0.0, 0.5, 1.0
-    for idx in vis_indices:
-        ext_coords, ext_adj, ext_props, stats = all_results[idx]
-        theta = stats["theta"]
-        label = f"theta{theta:.1f}".replace(".", "")
+    # Render with the color texture and normal map
+    egg_render = egg(color_tex, normal_map)
 
-        print(f"\n  --- Visualizing theta={theta:.1f} ---")
+    t1 = time.time()
+    save_image(egg_render, out / f"lattice_egg_render_{ts}.png", timestamp=False)
+    stats["phase5_egg_render"] = {
+        "egg_resolution": egg_res,
+        "render_std": round(egg_render.std().item(), 4),
+        "render_nonzero": round((egg_render.abs() > 0.01).float().mean().item(), 4),
+        "time_s": round(t1 - t0, 3),
+    }
+    print(f"  Render std: {egg_render.std():.4f}")
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-        # Create height-field image from graph
-        t_vis_start = time.time()
-        height_img = graph_to_height_image(
-            ext_coords, ext_props, resolution=args.resolution, value_column=3
-        )
+    # ================================================================
+    # Phase 6: Render egg with height-only texture (channels visible as geometry)
+    # ================================================================
+    print("Phase 6: Rendering egg with height-only texture...")
+    t0 = time.time()
 
-        # Create lattice-type visualization
-        lattice_img = graph_to_lattice_type_image(
-            ext_coords, ext_props, resolution=args.resolution
-        )
+    # Use height field as a grayscale "material" texture
+    # Bumps (positive) = light areas, channels (negative) = dark grooves
+    h_tex = h_norm.unsqueeze(-1).expand(-1, -1, 3).contiguous()
+    # Warm tint: multiply by a warm color to make it look like carved stone
+    stone_color = torch.tensor([0.85, 0.75, 0.60], device=device)
+    h_tex_tinted = h_tex * stone_color
 
-        # Save lattice type map
-        save_image(lattice_img, args.output_dir / f"demo2_lattice_types_{label}.png")
+    egg_height_render = egg(h_tex_tinted, normal_map)
+    t1 = time.time()
+    save_image(egg_height_render, out / f"lattice_egg_carved_{ts}.png", timestamp=False)
+    stats["phase6_carved"] = {"time_s": round(t1 - t0, 3)}
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-        # Height -> normals -> egg render
-        normals = height_to_normals(height_img)
+    # ================================================================
+    # Phase 7: Render egg with combined type color + height modulation
+    # ================================================================
+    print("Phase 7: Rendering combined type + height egg...")
+    t0 = time.time()
 
-        # Create texture from lattice type image for the egg
-        texture = lattice_img.clone()
+    # Modulate type colors by height field: bumps stay bright, channels darken
+    h_mod = (h_norm * 0.6 + 0.4).unsqueeze(-1)  # [0.4, 1.0] range
+    combined_tex = color_tex * h_mod
+    egg_combined = egg(combined_tex, normal_map)
+    t1 = time.time()
+    save_image(egg_combined, out / f"lattice_egg_combined_{ts}.png", timestamp=False)
+    stats["phase7_combined"] = {"time_s": round(t1 - t0, 3)}
+    print(f"  Time: {t1 - t0:.3f}s")
+    print()
 
-        rendered = egg_renderer(texture, normals)
-        t_vis_end = time.time()
+    # ================================================================
+    # Summary
+    # ================================================================
+    total_time = sum(v.get("time_s", 0) for v in stats.values() if isinstance(v, dict))
+    stats["total_time_s"] = round(total_time, 2)
+    stats["images_written"] = 5
 
-        save_image(height_img.unsqueeze(-1).expand(-1, -1, 3),
-                   args.output_dir / f"demo2_height_{label}.png")
-        save_image(rendered, args.output_dir / f"demo2_egg_{label}.png")
+    stats_path = out / "stats.json"
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
 
-        print(f"       Height field, lattice map, and egg render saved")
-        print(f"       Time: {t_vis_end - t_vis_start:.3f}s")
-
-    # ===================================================================
-    # Step 6: Summary
-    # ===================================================================
-    total_end = time.time()
-
-    print("\n" + "=" * 60)
-    print("Demo 2: Lattice Extrusion -- Complete")
     print("=" * 60)
-    print(f"  Base graph:        {n} nodes, {n_edges} edges (islands + bridge)")
-    print(f"  Theta values:      {theta_values}")
-    print(f"  Lattice types seen: {sorted(all_lattice_types_seen)}")
-    print(f"  Total time:        {total_end - total_start:.2f}s")
+    print(f"  Total time: {total_time:.2f}s")
+    print(f"  Images: 5 written to {out}/")
+    print(f"  Stats:  {stats_path}")
     print()
-    print("  Per-theta results:")
-    for _, _, _, stats in all_results:
-        theta = stats["theta"]
-        tc = stats["type_counts"]
-        print(f"    theta={theta:.1f}: {stats['total_nodes']} nodes, "
-              f"{stats['num_layers']} layers, "
-              f"types: sq={tc['square']} tri={tc['triangle']} hex={tc['hex']}")
+
+    # Checks
+    checks = [
+        ("nodes >= 1000", lattice["n"] >= 1000),
+        ("edges >= 3000", lattice["n_edges"] >= 3000),
+        ("distinct directions >= 17", lattice["n_distinct_directions"] >= 17),
+        ("height field nonzero > 50%",
+         (height_field.abs() > 1e-4).float().mean().item() > 0.5),
+        ("height field has bumps AND channels",
+         height_field.max().item() > 0.1 and height_field.min().item() < -0.1),
+        ("egg render std > 0.05", egg_render.std().item() > 0.05),
+        ("no NaN in renders",
+         not (torch.isnan(egg_render).any() or torch.isnan(height_field).any())),
+    ]
+
+    print("Checks:")
+    all_pass = True
+    for name, passed in checks:
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            all_pass = False
+        print(f"  [{status}] {name}")
+
+    stats["checks"] = {name: passed for name, passed in checks}
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
     print()
-    print("  Outputs:")
-    print(f"    Lattice type maps:  {args.output_dir}/demo2_lattice_types_*.png")
-    print(f"    Height fields:      {args.output_dir}/demo2_height_*.png")
-    print(f"    Egg renders:        {args.output_dir}/demo2_egg_*.png")
-    print()
-    print("  Lattice type color code:")
-    print("    Blue  = square  (degree 4, girth 4)")
-    print("    Red   = triangle (degree 6, girth 3)")
-    print("    Green = hex     (degree 3, girth 6)")
-    print()
-    print("  Composition chain:")
-    print("    base graph -> spectral analysis -> lattice selection -> extrusion -> 3D visualization")
+    if all_pass:
+        print("All checks passed.")
+    else:
+        print("Some checks FAILED.")
+
+    return 0 if all_pass else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

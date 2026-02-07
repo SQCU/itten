@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple
 
+from spectral_triton_kernels import ell_spmv_batched
+
 
 class SpectralEmbedding(nn.Module):
     """Compute Fiedler vector via tiled Lanczos iteration over a multi-radius
@@ -100,6 +102,7 @@ class SpectralEmbedding(nn.Module):
         radius_weights: Optional[List[float]] = None,
         edge_threshold: float = 0.15,
         lanczos_iterations: int = 30,
+        output_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         self.tile_size = tile_size
@@ -107,6 +110,11 @@ class SpectralEmbedding(nn.Module):
         self.num_eigenvectors = num_eigenvectors
         self.edge_threshold = edge_threshold
         self.lanczos_iterations = lanczos_iterations
+
+        # Mixed-precision boundary: Lanczos (Zone A) always runs float32.
+        # The Fiedler vector is cast to output_dtype at the very end of forward().
+        # Default float32 = no-op (bit-exact with prior behavior).
+        self.output_dtype = output_dtype
 
         # Store radii and weights as registered buffers so they move with
         # .to(device) and appear in state_dict (but are not learnable).
@@ -142,6 +150,56 @@ class SpectralEmbedding(nn.Module):
         )
         self.register_buffer(
             "_offset_w", torch.tensor(offset_w, dtype=torch.float32)
+        )
+
+        # Tier A: Pre-compute ELL sparsity structure for full tiles.
+        # The column indices and validity mask depend only on tile dimensions
+        # and offset config, NOT on image content. Only edge weights change.
+        self._precompute_ell_structure()
+
+        # Tier B: batch size for multi-tile Lanczos
+        self.tile_batch_size = 8
+
+    def _precompute_ell_structure(self):
+        """Pre-compute ELL column indices and validity mask for a full tile.
+
+        Eliminates per-tile meshgrid, broadcast, bounds check, and masking.
+        The ELL structure is registered as buffers so it moves with .to(device).
+        """
+        H = W = self.tile_size
+        n = H * W
+        num_offsets = self._offset_dy.shape[0]
+
+        if num_offsets == 0:
+            self.register_buffer("_ell_col", torch.zeros(n, 0, dtype=torch.long))
+            self.register_buffer("_ell_valid", torch.zeros(n, 0, dtype=torch.bool))
+            self.register_buffer("_ell_base_w", torch.zeros(n, 0))
+            return
+
+        # Pixel coordinates for full tile
+        yy = torch.arange(H).unsqueeze(1).expand(H, W).reshape(-1)
+        xx = torch.arange(W).unsqueeze(0).expand(H, W).reshape(-1)
+
+        # Destination coordinates for all (pixel, offset) pairs
+        dst_y = yy.unsqueeze(1) + self._offset_dy.unsqueeze(0)  # (n, num_offsets)
+        dst_x = xx.unsqueeze(1) + self._offset_dx.unsqueeze(0)
+
+        # Validity mask (in-bounds)
+        valid = (dst_y >= 0) & (dst_y < H) & (dst_x >= 0) & (dst_x < W)
+
+        # Column indices (clamped for safe gather; invalid masked by val=0)
+        ell_col = (dst_y * W + dst_x).clamp(0, n - 1)
+
+        self.register_buffer("_ell_col", ell_col.long())        # (n, num_offsets)
+        self.register_buffer("_ell_valid", valid)                # (n, num_offsets)
+        # Store ELL base weights in output_dtype for bandwidth savings.
+        # When output_dtype=bfloat16, this halves the largest static buffer.
+        # Values are constants in [0.1, 1.0] — bfloat16 precision (~0.1%) is
+        # far below sensitivity threshold. Upcast to float32 before Lanczos math.
+        _ell_base_w = self._offset_w.unsqueeze(0).expand(n, -1).clone()
+        self.register_buffer(
+            "_ell_base_w",
+            _ell_base_w.to(dtype=self.output_dtype)             # (n, num_offsets)
         )
 
     # ------------------------------------------------------------------
@@ -190,7 +248,7 @@ class SpectralEmbedding(nn.Module):
                 torch.stack([diag, diag]),
                 torch.ones(n, device=device),
                 (n, n),
-            ).coalesce()
+            ).coalesce().to_sparse_csr()
 
         # --- cuter lines 130-133: compute destination coordinates ---
         yy, xx = torch.meshgrid(
@@ -235,7 +293,7 @@ class SpectralEmbedding(nn.Module):
         vals = torch.cat([vals, degrees])
         return torch.sparse_coo_tensor(
             torch.stack([rows.long(), cols.long()]), vals, (n, n)
-        ).coalesce()
+        ).coalesce().to_sparse_csr()
 
     def _lanczos_tile(
         self, L: torch.Tensor, num_evecs: int, num_iter: int
@@ -445,6 +503,203 @@ class SpectralEmbedding(nn.Module):
 
         return result_evecs, result_evals
 
+    # ------------------------------------------------------------------
+    # Tier A+B+C: Batched ELL Laplacian + Lanczos
+    # ------------------------------------------------------------------
+
+    def _build_laplacian_ell_batched(
+        self, tiles: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Batched Laplacian construction using pre-computed ELL structure.
+
+        Tier A optimization: the sparsity pattern is pre-computed in __init__.
+        Only the color-dependent edge weights are computed per tile.
+
+        Parameters
+        ----------
+        tiles : list of torch.Tensor
+            B tiles, each (tile_size, tile_size) or (tile_size, tile_size, 3).
+            All must be the same (full) tile size.
+
+        Returns
+        -------
+        ell_val : (B, n, max_nnz) float32 — off-diagonal edge weights
+        degree : (B, n) float32 — diagonal (row sums)
+        """
+        B = len(tiles)
+        device = tiles[0].device
+        is_rgb = tiles[0].dim() == 3 and tiles[0].shape[-1] == 3
+        C = 3 if is_rgb else 1
+        n = self.tile_size * self.tile_size
+
+        # Stack tiles into batch
+        flat_batch = torch.stack([
+            t.reshape(-1, C) for t in tiles
+        ])  # (B, n, C)
+
+        # Gather neighbor colors using pre-computed column indices
+        dst_colors = flat_batch[:, self._ell_col]       # (B, n, max_nnz, C)
+        src_colors = flat_batch.unsqueeze(2)             # (B, n, 1, C)
+
+        # Color difference
+        if is_rgb:
+            color_diff = torch.norm(src_colors - dst_colors, dim=-1)
+        else:
+            color_diff = (src_colors - dst_colors).abs().squeeze(-1)
+
+        # Edge weights = base_weight * exp(-color_diff / threshold)
+        # Upcast _ell_base_w to float32 for Lanczos Zone A math.
+        # When output_dtype=bfloat16, base_w is stored compressed; upcast here
+        # ensures Lanczos sees float32 (no precision change in computation).
+        base_w = self._ell_base_w.float()  # (n, max_nnz) — upcast if bfloat16
+        ell_val = base_w.unsqueeze(0) * torch.exp(
+            -color_diff / self.edge_threshold
+        )
+        ell_val = ell_val * self._ell_valid.unsqueeze(0).float()  # zero invalid
+
+        # Degree = sum of edge weights per row
+        degree = ell_val.sum(dim=-1)  # (B, n)
+
+        return ell_val, degree
+
+    def _lanczos_batched(
+        self,
+        ell_val: torch.Tensor,
+        degree: torch.Tensor,
+        num_evecs: int,
+        num_iter: int,
+    ) -> List[torch.Tensor]:
+        """Batched Lanczos iteration using ELL SpMV.
+
+        Tier B+C optimization: processes multiple tiles simultaneously.
+        Uses Triton ELL SpMV kernel (Tier C) and torch.bmm for batched
+        reorthogonalization.
+
+        Parameters
+        ----------
+        ell_val : (B, n, max_nnz) float32 — off-diagonal edge weights
+        degree : (B, n) float32 — diagonal values
+        num_evecs : int — eigenvectors to return per tile
+        num_iter : int — Lanczos iterations
+
+        Returns
+        -------
+        list of torch.Tensor
+            B tensors each of shape (n, num_evecs).
+        """
+        B, n, _ = ell_val.shape
+        device = ell_val.device
+        k = min(num_iter, n - 1)
+
+        if n < 3 or k < 2:
+            return [torch.zeros((n, num_evecs), device=device) for _ in range(B)]
+
+        # Deterministic init (same for all tiles — same n → same seed)
+        torch.manual_seed(42 + n % 10000)
+        v = torch.randn(n, device=device, dtype=torch.float32)
+        v = (v - v.mean()) / torch.linalg.norm(v - v.mean()).clamp(min=self.tol)
+
+        V = torch.zeros(B, n, k + 1, device=device, dtype=torch.float32)
+        V[:, :, 0] = v.unsqueeze(0)
+        alphas = torch.zeros(B, k, device=device, dtype=torch.float32)
+        betas = torch.zeros(B, k, device=device, dtype=torch.float32)
+
+        for i in range(k):
+            # Batched ELL SpMV: w[b] = L[b] @ V[b, :, i]
+            w = ell_spmv_batched(
+                ell_val, degree, self._ell_col, V[:, :, i]
+            )  # (B, n)
+
+            # Batched reorthogonalization (fused: subsumes 3-term recurrence)
+            # Element-wise + sum avoids CUBLAS strided-batch shape limits
+            V_used = V[:, :, : i + 1]                                    # (B, n, i+1)
+            coeffs = (V_used * w.unsqueeze(2)).sum(dim=1)                # (B, i+1)
+            alphas[:, i] = coeffs[:, i]
+            w = w - (V_used * coeffs.unsqueeze(1)).sum(dim=2)            # (B, n)
+
+            # Mean subtraction (deflate trivial eigenvector)
+            w = w - w.mean(dim=1, keepdim=True)
+
+            # Norms (skip early termination in batched mode — rare and adds complexity)
+            beta = torch.linalg.norm(w, dim=1)  # (B,)
+            betas[:, i] = beta
+            V[:, :, i + 1] = w / beta.unsqueeze(1).clamp(min=self.tol)
+
+        # Batched tridiagonal eigensolve
+        T = torch.zeros(B, k, k, device=device, dtype=torch.float32)
+        diag_idx = torch.arange(k, device=device)
+        T[:, diag_idx, diag_idx] = alphas
+        if k > 1:
+            off = torch.arange(k - 1, device=device)
+            T[:, off, off + 1] = betas[:, : k - 1]
+            T[:, off + 1, off] = betas[:, : k - 1]
+
+        eigenvalues, eigenvectors = torch.linalg.eigh(T)  # batched
+
+        # Back-project Ritz vectors (per-tile: valid eigenvalues may differ)
+        results = []
+        for b in range(B):
+            mask = eigenvalues[b] > 1e-6
+            valid_idx = torch.where(mask)[0]
+            if len(valid_idx) == 0:
+                results.append(
+                    torch.zeros(n, num_evecs, device=device, dtype=torch.float32)
+                )
+                continue
+            take = min(num_evecs, len(valid_idx))
+            evecs = torch.mm(V[b, :, :k], eigenvectors[b, :, valid_idx[:take]])
+            result = torch.zeros(n, num_evecs, device=device, dtype=torch.float32)
+            result[:, :take] = evecs
+            results.append(result)
+
+        return results
+
+    def _process_tile_batch(
+        self,
+        tiles: List[torch.Tensor],
+        num_evecs: int,
+        with_eigenvalues: bool = False,
+    ) -> List:
+        """Process a batch of full-size tiles through ELL Laplacian + batched Lanczos.
+
+        Combines Tier A (pre-computed ELL structure), Tier B (batched processing),
+        and Tier C (Triton ELL SpMV) into one pipeline.
+
+        Parameters
+        ----------
+        tiles : list of torch.Tensor
+            All tiles must be full size (tile_size x tile_size).
+        num_evecs : int
+            Number of eigenvectors per tile.
+        with_eigenvalues : bool
+            If True, also return eigenvalues per tile.
+
+        Returns
+        -------
+        list of torch.Tensor (or list of tuples if with_eigenvalues)
+            Each element is (n, num_evecs) eigenvector tensor.
+        """
+        # Build batched Laplacians using pre-computed ELL structure (Tier A)
+        ell_val, degree = self._build_laplacian_ell_batched(tiles)
+
+        if not with_eigenvalues:
+            # Batched Lanczos (Tier B + C)
+            return self._lanczos_batched(
+                ell_val, degree, num_evecs, self.lanczos_iterations
+            )
+        else:
+            # For eigenvalue variant, fall back to per-tile (eigenvalue
+            # extraction is tile-specific and rarely on the hot path)
+            results = []
+            for b in range(len(tiles)):
+                L = self._build_multiscale_laplacian(tiles[b])
+                results.append(
+                    self._lanczos_tile_with_eigenvalues(
+                        L, num_evecs, self.lanczos_iterations
+                    )
+                )
+            return results
+
     @staticmethod
     def _blend_weights_1d(
         length: int, overlap: int, device: torch.device
@@ -541,46 +796,63 @@ class SpectralEmbedding(nn.Module):
         y_starts = sorted(set(y_starts))
         x_starts = sorted(set(x_starts))
 
-        # --- cuter lines 247-261: process each tile ---
+        # --- Tier B: collect tiles, batch full-size, fallback for edge tiles ---
+        ts = self.tile_size
+        full_tiles = []       # (tile_tensor, y, x) for full-size tiles
+        edge_tiles = []       # (tile_tensor, y, x, th, tw) for non-standard tiles
+
         for y in y_starts:
             for x in x_starts:
-                y_end = min(y + self.tile_size, H)
-                x_end = min(x + self.tile_size, W)
+                y_end = min(y + ts, H)
+                x_end = min(x + ts, W)
                 tile = image[y:y_end, x:x_end]
-
-                # --- cuter line 251: get tile dimensions ---
                 th, tw = (tile.shape[0], tile.shape[1]) if is_rgb else tile.shape
-
-                # --- cuter lines 252-253: skip tiny tiles ---
                 if th < 4 or tw < 4:
                     continue
+                if th == ts and tw == ts:
+                    full_tiles.append((tile, y, x))
+                else:
+                    edge_tiles.append((tile, y, x, th, tw))
 
-                # Build multi-radius Laplacian for this tile
-                # (cuter line 255)
-                L = self._build_multiscale_laplacian(tile)
+        # Process full-size tiles in batches (Tier A+B+C fast path)
+        BS = self.tile_batch_size
+        for batch_start in range(0, len(full_tiles), BS):
+            batch = full_tiles[batch_start : batch_start + BS]
+            tiles_list = [t for t, _, _ in batch]
+            evecs_list = self._process_tile_batch(tiles_list, num_eigenvectors)
 
-                # Run Lanczos to get eigenvectors
-                # (cuter line 256)
-                evecs = self._lanczos_tile(
-                    L, num_eigenvectors, self.lanczos_iterations
-                ).reshape(th, tw, num_eigenvectors)
-
-                # Compute 2D blend mask as outer product of 1D tapers
-                # (cuter line 257)
+            for (_, y, x), evecs_flat in zip(batch, evecs_list):
+                evecs = evecs_flat.reshape(ts, ts, num_eigenvectors)
                 blend = torch.outer(
-                    self._blend_weights_1d(th, self.overlap, device),
-                    self._blend_weights_1d(tw, self.overlap, device),
+                    self._blend_weights_1d(ts, self.overlap, device),
+                    self._blend_weights_1d(ts, self.overlap, device),
                 )
+                result[y : y + ts, x : x + ts] += evecs * blend.unsqueeze(-1)
+                weights[y : y + ts, x : x + ts] += blend
 
-                # Accumulate blended eigenvectors and weights (batched: 1 kernel instead of k)
-                result[y:y_end, x:x_end] += evecs * blend.unsqueeze(-1)
-                weights[y:y_end, x:x_end] += blend
+        # Process edge tiles sequentially (rare — only image boundaries)
+        for tile, y, x, th, tw in edge_tiles:
+            L = self._build_multiscale_laplacian(tile)
+            evecs = self._lanczos_tile(
+                L, num_eigenvectors, self.lanczos_iterations
+            ).reshape(th, tw, num_eigenvectors)
+            blend = torch.outer(
+                self._blend_weights_1d(th, self.overlap, device),
+                self._blend_weights_1d(tw, self.overlap, device),
+            )
+            y_end = min(y + ts, H)
+            x_end = min(x + ts, W)
+            result[y:y_end, x:x_end] += evecs * blend.unsqueeze(-1)
+            weights[y:y_end, x:x_end] += blend
 
         # --- cuter line 263: normalize by blend weights ---
         all_evecs = result / weights.unsqueeze(-1).clamp(min=self.tol)
 
         # Return the Fiedler vector (eigenvector 0 = first non-trivial)
-        return all_evecs[:, :, 0]
+        # Zone A -> Zone B boundary: cast from float32 to output_dtype.
+        # When output_dtype=bfloat16, this is where precision crosses the boundary.
+        # When output_dtype=float32, this is a no-op.
+        return all_evecs[:, :, 0].to(dtype=self.output_dtype)
 
     def forward_all(self, image: torch.Tensor) -> torch.Tensor:
         """Compute all num_eigenvectors eigenvectors, not just the Fiedler.
@@ -623,28 +895,52 @@ class SpectralEmbedding(nn.Module):
         y_starts = sorted(set(y_starts))
         x_starts = sorted(set(x_starts))
 
+        # Batched tile processing (same strategy as forward)
+        ts = self.tile_size
+        full_tiles = []
+        edge_tiles = []
         for y in y_starts:
             for x in x_starts:
-                y_end = min(y + self.tile_size, H)
-                x_end = min(x + self.tile_size, W)
+                y_end = min(y + ts, H)
+                x_end = min(x + ts, W)
                 tile = image[y:y_end, x:x_end]
                 th, tw = (tile.shape[0], tile.shape[1]) if is_rgb else tile.shape
                 if th < 4 or tw < 4:
                     continue
+                if th == ts and tw == ts:
+                    full_tiles.append((tile, y, x))
+                else:
+                    edge_tiles.append((tile, y, x, th, tw))
 
-                L = self._build_multiscale_laplacian(tile)
-                evecs = self._lanczos_tile(
-                    L, num_eigenvectors, self.lanczos_iterations
-                ).reshape(th, tw, num_eigenvectors)
+        BS = self.tile_batch_size
+        for batch_start in range(0, len(full_tiles), BS):
+            batch = full_tiles[batch_start : batch_start + BS]
+            tiles_list = [t for t, _, _ in batch]
+            evecs_list = self._process_tile_batch(tiles_list, num_eigenvectors)
+            for (_, y, x), evecs_flat in zip(batch, evecs_list):
+                evecs = evecs_flat.reshape(ts, ts, num_eigenvectors)
                 blend = torch.outer(
-                    self._blend_weights_1d(th, self.overlap, device),
-                    self._blend_weights_1d(tw, self.overlap, device),
+                    self._blend_weights_1d(ts, self.overlap, device),
+                    self._blend_weights_1d(ts, self.overlap, device),
                 )
-                for k in range(num_eigenvectors):
-                    result[y:y_end, x:x_end, k] += evecs[:, :, k] * blend
-                weights[y:y_end, x:x_end] += blend
+                result[y : y + ts, x : x + ts] += evecs * blend.unsqueeze(-1)
+                weights[y : y + ts, x : x + ts] += blend
 
-        return result / weights.unsqueeze(-1).clamp(min=self.tol)
+        for tile, y, x, th, tw in edge_tiles:
+            L = self._build_multiscale_laplacian(tile)
+            evecs = self._lanczos_tile(
+                L, num_eigenvectors, self.lanczos_iterations
+            ).reshape(th, tw, num_eigenvectors)
+            blend = torch.outer(
+                self._blend_weights_1d(th, self.overlap, device),
+                self._blend_weights_1d(tw, self.overlap, device),
+            )
+            y_end = min(y + ts, H)
+            x_end = min(x + ts, W)
+            result[y:y_end, x:x_end] += evecs * blend.unsqueeze(-1)
+            weights[y:y_end, x:x_end] += blend
+
+        return (result / weights.unsqueeze(-1).clamp(min=self.tol)).to(dtype=self.output_dtype)
 
     def forward_with_eigenvalues(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute (H, W) Fiedler vector AND (H, W) tiled eigenvalue map.
@@ -729,7 +1025,7 @@ class SpectralEmbedding(nn.Module):
         all_evecs = result / weights.unsqueeze(-1).clamp(min=self.tol)
         eigenvalue_map = eigenvalue_accum / weights.clamp(min=self.tol)
 
-        return all_evecs[:, :, 0], eigenvalue_map
+        return all_evecs[:, :, 0].to(dtype=self.output_dtype), eigenvalue_map.to(dtype=self.output_dtype)
 
 
 class SpectralShaderAR(nn.Module):

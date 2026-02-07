@@ -457,9 +457,14 @@ def cross_attention_transfer(
     # 9. Hadamard composite
     segment_composite = composite_layers_hadamard(shadow_layer, shadow_mask, front_layer, front_mask)
 
-    # 10. Blend with base image
+    # 10. Underpaint: only deposit fragments into void regions of the target.
+    # gate_A encodes the graph's view of content vs void:
+    #   gate < 0.5 = content (markings, structure) -> preserve
+    #   gate >= 0.5 = void (negative space) -> safe to write
     combined_mask = torch.clamp(shadow_mask + front_mask, 0, 1).unsqueeze(-1)
-    return image_A * (1 - combined_mask) + segment_composite * combined_mask
+    void_A = (gate_A >= 0.5).float().unsqueeze(-1)
+    effective_mask = combined_mask * void_A
+    return image_A * (1 - effective_mask) + segment_composite * effective_mask
 
 
 # ============================================================
